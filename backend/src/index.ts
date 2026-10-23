@@ -116,8 +116,9 @@ app.get("/api/projects", auth, async (req: AuthReq, res) => {
   const projects = await prisma.project.findMany({
     where,
     include: {
-      tasks: { include: { assignee: { select: { id: true, name: true } } } },
+      tasks: { include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } } } },
       manager: { select: { id: true, name: true } },
+      memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } },
     },
     orderBy: { createdAt: "desc" },
   });
@@ -209,6 +210,110 @@ app.post("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
         include: { assignee: { select: { id: true, name: true } } },
       }),
     );
+});
+app.get("/api/users", auth, async (req: AuthReq, res) => {
+  if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
+  res.json(await prisma.user.findMany({ select: { id: true, name: true, email: true, role: true, active: true, createdAt: true }, orderBy: { name: "asc" } }));
+});
+app.post("/api/users", auth, async (req: AuthReq, res) => {
+  if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ name: z.string().min(1).max(100), email: z.string().email(), password: z.string().min(10), role: z.enum([Role.ADMIN, Role.PROJECT_MANAGER, Role.TEAM_MEMBER, Role.VIEWER]) }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  if (await prisma.user.findUnique({ where: { email: b.data.email } })) return res.status(409).json({ error: "EMAIL_EXISTS" });
+  const user = await prisma.user.create({ data: { ...b.data, passwordHash: await bcrypt.hash(b.data.password, 10) }, select: { id: true, name: true, email: true, role: true, active: true } });
+  res.status(201).json(user);
+});
+app.patch("/api/users/:id", auth, async (req: AuthReq, res) => {
+  if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ name: z.string().min(1).max(100).optional(), email: z.string().email().optional(), password: z.string().min(10).optional(), role: z.enum([Role.ADMIN, Role.PROJECT_MANAGER, Role.TEAM_MEMBER, Role.VIEWER]).optional() }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  const { password, ...fields } = b.data;
+  const user = await prisma.user.update({ where: { id: String(req.params.id) }, data: { ...fields, ...(password ? { passwordHash: await bcrypt.hash(password, 10) } : {}) }, select: { id: true, name: true, email: true, role: true, active: true } }).catch(() => null);
+  return user ? res.json(user) : res.status(404).json({ error: "NOT_FOUND" });
+});
+app.patch("/api/users/:id/deactivate", auth, async (req: AuthReq, res) => {
+  if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
+  if (String(req.params.id) === req.user!.id) return res.status(400).json({ error: "CANNOT_DEACTIVATE_SELF" });
+  const result = await prisma.user.updateMany({ where: { id: String(req.params.id), active: true }, data: { active: false } });
+  return result.count ? res.json({ id: req.params.id, active: false }) : res.status(404).json({ error: "NOT_FOUND" });
+});
+app.get("/api/projects/:id", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await access(req.user!.id, req.user!.role, id))) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json(await prisma.project.findUnique({ where: { id }, include: { manager: { select: { id: true, name: true } }, memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } }, tasks: { include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } } } } } } }));
+});
+app.patch("/api/projects/:id", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ name: z.string().min(1).max(100).optional(), description: z.string().max(1000).optional(), managerId: z.string().optional() }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  if (b.data.managerId && req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "ONLY_ADMIN_CAN_REASSIGN_MANAGER" });
+  if (b.data.managerId) { const m = await prisma.user.findUnique({ where: { id: b.data.managerId } }); if (!m?.active || m.role !== Role.PROJECT_MANAGER) return res.status(400).json({ error: "INVALID_MANAGER" }); }
+  const project = await prisma.project.update({ where: { id }, data: b.data }).catch(() => null);
+  return project ? res.json(project) : res.status(404).json({ error: "NOT_FOUND" });
+});
+app.patch("/api/projects/:id/archive", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ archived: z.boolean() }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  const p = await prisma.project.update({ where: { id }, data: { archived: b.data.archived } }).catch(() => null);
+  return p ? res.json(p) : res.status(404).json({ error: "NOT_FOUND" });
+});
+app.delete("/api/projects/:id", auth, async (req: AuthReq, res) => {
+  if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
+  const deleted = await prisma.project.deleteMany({ where: { id: String(req.params.id) } });
+  if (!deleted.count) return res.status(404).json({ error: "NOT_FOUND" });
+  res.status(204).end();
+});
+app.get("/api/projects/:id/members", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await access(req.user!.id, req.user!.role, id))) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json(await prisma.projectMember.findMany({ where: { projectId: id }, include: { user: { select: { id: true, name: true, email: true, role: true } } } }));
+});
+app.post("/api/projects/:id/members", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ userId: z.string(), role: z.enum(["MANAGER", "MEMBER", "VIEWER"]) }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  const u = await prisma.user.findUnique({ where: { id: b.data.userId } });
+  if (!u?.active) return res.status(400).json({ error: "INVALID_MEMBER" });
+  const member = await prisma.projectMember.create({ data: { projectId: id, ...b.data } }).catch(() => null);
+  return member ? res.status(201).json(member) : res.status(409).json({ error: "MEMBERSHIP_EXISTS" });
+});
+app.patch("/api/projects/:id/members/:userId", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  const b = z.object({ role: z.enum(["MANAGER", "MEMBER", "VIEWER"]) }).safeParse(req.body);
+  if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  const member = await prisma.projectMember.update({ where: { projectId_userId: { projectId: id, userId: String(req.params.userId) } }, data: b.data }).catch(() => null);
+  return member ? res.json(member) : res.status(404).json({ error: "NOT_FOUND" });
+});
+app.delete("/api/tasks/:id", auth, async (req: AuthReq, res) => {
+  const task = await prisma.task.findUnique({ where: { id: String(req.params.id) } });
+  if (!task) return res.status(404).json({ error: "NOT_FOUND" });
+  if (!(await isManager(req.user!.id, req.user!.role, task.projectId))) return res.status(403).json({ error: "FORBIDDEN" });
+  await prisma.task.delete({ where: { id: task.id } });
+  res.status(204).end();
+});
+app.get("/api/tasks/:id/comments", auth, async (req: AuthReq, res) => {
+  const task = await prisma.task.findUnique({ where: { id: String(req.params.id) } });
+  if (!task || !(await access(req.user!.id, req.user!.role, task.projectId))) return res.status(404).json({ error: "NOT_FOUND" });
+  res.json(await prisma.comment.findMany({ where: { taskId: task.id }, include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } }));
+});
+app.delete("/api/comments/:id", auth, async (req: AuthReq, res) => {
+  const comment = await prisma.comment.findUnique({ where: { id: String(req.params.id) }, include: { task: true } });
+  if (!comment) return res.status(404).json({ error: "NOT_FOUND" });
+  const manager = await isManager(req.user!.id, req.user!.role, comment.task.projectId);
+  if (!manager && comment.authorId !== req.user!.id) return res.status(403).json({ error: "FORBIDDEN" });
+  await prisma.comment.delete({ where: { id: comment.id } });
+  res.status(204).end();
+});
+app.delete("/api/projects/:id/members/:userId", auth, async (req: AuthReq, res) => {
+  const id = String(req.params.id);
+  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  const result = await prisma.projectMember.deleteMany({ where: { projectId: id, userId: String(req.params.userId) } });
+  return result.count ? res.status(204).end() : res.status(404).json({ error: "NOT_FOUND" });
 });
 app.patch("/api/tasks/:id", auth, async (req: AuthReq, res) => {
   const b = z

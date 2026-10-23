@@ -40,3 +40,37 @@ All seeded accounts use `NeoStats123!`:
 Task reads include a numeric `version`. A PATCH must send the version it read. The API uses one conditional `updateMany` matching both task ID and version while incrementing the version. If no row matches, it returns `409 TASK_VERSION_CONFLICT` and the current safe task fields. Comments can be added by non-viewers with project access; deletion and broader user/project administration routes are not yet included in this foundation.
 
 `.env` files are ignored. Never commit local credentials.
+
+## Implemented workflows
+
+- Admins can list/create/update/deactivate users, create projects, assign active Project Managers, view all projects, and delete projects.
+- Admins and assigned Project Managers can update/archive projects, manage project memberships and scoped membership roles, and create/delete tasks. Manager reassignment remains Admin-only.
+- Team Members can read member projects, update tasks assigned to them using the required current `version`, and add comments. Viewers can read project/task/comment data but cannot mutate it.
+- Users can list comments; a comment author or the assigned Project Manager/Admin can delete a comment. Inactive accounts are rejected on protected requests.
+- The dashboard includes project and task creation, project rename/archive/delete controls, member role controls, task status/deletion controls, comments, and Admin user create/deactivate controls. API authorization remains authoritative.
+
+## Local setup
+
+Use only the local PostgreSQL service. Create the `neostats` database, copy `.env.example` to `backend/.env`, then set `DATABASE_URL` to the local account/database and set a random `JWT_SECRET` with at least 32 characters. Keep `backend/.env` private; it is ignored by Git. Copy `frontend/.env.example` to `frontend/.env.local`.
+
+From the repository root, install and prepare the database:
+
+```powershell
+npm install --prefix backend
+npm install --prefix frontend
+npm run prisma:migrate --prefix backend -- --name init
+npm run prisma:seed --prefix backend
+```
+
+Run these in separate terminals:
+
+```powershell
+npm run dev --prefix backend
+npm run dev --prefix frontend
+```
+
+The frontend is at http://localhost:3000. The API health endpoint is http://localhost:4000/api/health.
+
+Seeded demo credentials (all use `NeoStats123!`): Admin `admin@neostats.local`; Project Manager `manager@neostats.local`; Team Member `member@neostats.local`; Viewer `viewer@neostats.local`.
+
+Membership roles (`MANAGER`, `MEMBER`, `VIEWER`) are project-scoped and never grant global privileges. Current limitations: this foundation does not provide a full standalone user-edit form, project pagination/filtering, or comment editing; Admin can update users through the API. Task changes require a version and stale writes return 409 `TASK_VERSION_CONFLICT`.
