@@ -9,7 +9,12 @@ import { z } from "zod";
 const prisma = new PrismaClient();
 const app = express();
 const secret = process.env.JWT_SECRET;
-const origin = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
+const allowedOrigins = new Set(
+  (process.env.FRONTEND_ORIGIN || "http://localhost:3000,http://localhost:3001")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 if (!secret || secret.length < 32)
   throw new Error("JWT_SECRET must be set to at least 32 characters.");
 const Role = {
@@ -24,7 +29,13 @@ const TaskStatus = {
   IN_PROGRESS: "IN_PROGRESS",
   DONE: "DONE",
 } as const;
-app.use(cors({ origin, credentials: true }));
+app.use(
+  cors({
+    origin: (requestOrigin, callback) =>
+      callback(null, !requestOrigin || allowedOrigins.has(requestOrigin)),
+    credentials: true,
+  }),
+);
 app.use(express.json());
 app.use(cookieParser());
 type AuthReq = Request & { user?: { id: string; role: Role } };

@@ -7,7 +7,7 @@ Local collaborative project management demo. PostgreSQL runs on the laptop; Expr
 - Node.js 22+ and npm
 - PostgreSQL 14+ running locally, with a `neostats` database
 
-Create the local database as a PostgreSQL administrator (`createdb neostats`, or use pgAdmin). Copy `.env.example` to `backend/.env` and set `DATABASE_URL` to your local account/password. Set a private random `JWT_SECRET`. Copy `frontend/.env.example` to `frontend/.env.local`.
+Create the local database as a PostgreSQL administrator (`createdb neostats`, or use pgAdmin). Copy `.env.example` to `backend/.env` and set `DATABASE_URL` to your local account/password. Set a private random `JWT_SECRET`. The default `FRONTEND_ORIGIN` permits the local frontend on ports 3000 and 3001; separate multiple allowed origins with commas. Copy `frontend/.env.example` to `frontend/.env.local`.
 
 ## Install and run
 
