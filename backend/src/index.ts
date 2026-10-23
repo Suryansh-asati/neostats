@@ -116,7 +116,7 @@ app.get("/api/projects", auth, async (req: AuthReq, res) => {
   const projects = await prisma.project.findMany({
     where,
     include: {
-      tasks: { include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } } } },
+      tasks: { where: req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}, include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } } } },
       manager: { select: { id: true, name: true } },
       memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } },
     },
@@ -158,7 +158,7 @@ app.get("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
     return res.status(404).json({ error: "NOT_FOUND" });
   res.json(
     await prisma.task.findMany({
-      where: { projectId },
+      where: { projectId, ...(req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}) },
       include: {
         assignee: { select: { id: true, name: true } },
         comments: {
