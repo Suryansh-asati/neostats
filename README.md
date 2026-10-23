@@ -16,6 +16,7 @@ In separate terminals:
 ```powershell
 npm install --prefix backend
 npm install --prefix frontend
+npm run prisma:generate --prefix backend
 npm run prisma:migrate --prefix backend -- --name init
 npm run prisma:seed --prefix backend
 npm run dev --prefix backend
@@ -58,6 +59,7 @@ From the repository root, install and prepare the database:
 ```powershell
 npm install --prefix backend
 npm install --prefix frontend
+npm run prisma:generate --prefix backend
 npm run prisma:migrate --prefix backend -- --name init
 npm run prisma:seed --prefix backend
 ```
