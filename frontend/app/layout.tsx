@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
 export const metadata: Metadata = {
-  title: "NeoStats",
-  description: "Collaborative project management",
+  title: { default: "FlowForge | Project Workspace", template: "%s | FlowForge" },
+  description: "A collaborative project workspace for teams.",
 };
 export default function RootLayout({
   children,

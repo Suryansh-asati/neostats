@@ -252,7 +252,7 @@ app.patch("/api/users/:id/deactivate", auth, async (req: AuthReq, res) => {
 app.get("/api/projects/:id", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
   if (!(await access(req.user!.id, req.user!.role, id))) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json(await prisma.project.findUnique({ where: { id }, include: { manager: { select: { id: true, name: true } }, memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } }, tasks: { include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } } } } } } }));
+  res.json(await prisma.project.findUnique({ where: { id }, include: { manager: { select: { id: true, name: true } }, memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } }, tasks: { where: req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}, include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } } } } } } }));
 });
 app.patch("/api/projects/:id", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);

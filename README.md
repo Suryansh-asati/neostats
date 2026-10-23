@@ -1,6 +1,6 @@
-# NeoStats
+# FlowForge
 
-Local collaborative project management demo. PostgreSQL runs on the laptop; Express API and Next.js UI run as separate processes.
+FlowForge is a collaborative project workspace for planning projects, managing team tasks, and sharing progress. PostgreSQL runs locally; the Express API and Next.js UI run as separate processes.
 
 ## Prerequisites
 
@@ -34,9 +34,19 @@ All seeded accounts use `NeoStats123!`:
 - Team Member: `member@neostats.local`
 - Viewer: `viewer@neostats.local`
 
+## Application routes
+
+- `/` — sign in; authenticated users are redirected to the dashboard.
+- `/dashboard` — project and task summary.
+- `/projects` — accessible project list and project creation for Admins.
+- `/projects/[projectId]` — authorized project details, team, tasks, and comments.
+- `/tasks` — task list and task workflows.
+- `/team` — project membership and scoped role management.
+- `/admin/users` — Admin-only user management in the UI; API authorization remains authoritative.
+
 ## Architecture and authorization
 
-`backend/` is an Express TypeScript REST API and Prisma data layer; `frontend/` is a separate Next.js App Router UI. PostgreSQL stores users, projects, project memberships, tasks, and comments. Passwords use bcrypt hashes. Login issues an HTTP-only, same-site session cookie; every protected request reloads the user and checks that the account is active. Global roles are stored in the database and never accepted from request bodies. Admins see all projects and create projects; project managers manage projects assigned to them; members/viewers see only projects where they have membership. Project-level roles are `MANAGER`, `MEMBER`, and `VIEWER`; they express membership capabilities only and never grant global privileges. Team members can edit assigned tasks; viewers are read-only.
+`backend/` is an Express TypeScript REST API and Prisma data layer; `frontend/` is a separate Next.js App Router UI. PostgreSQL stores users, projects, project memberships, tasks, and comments. Passwords use bcrypt hashes. Login issues an HTTP-only, same-site session cookie; every protected request reloads the user and checks that the account is active. Global roles are stored in the database and never accepted from request bodies. Admins see all projects and create projects; project managers manage projects assigned to them; members/viewers see only projects where they have membership. Project-level roles are `MANAGER`, `MEMBER`, and `VIEWER`; they express membership capabilities only and never grant global privileges. Team members can edit assigned tasks; viewers are read-only. The authenticated workspace is shared across URL-based App Router pages; project detail data is fetched from the authorized project-by-ID API route and is not statically rendered.
 
 Task reads include a numeric `version`. A PATCH must send the version it read. The API uses one conditional `updateMany` matching both task ID and version while incrementing the version. If no row matches, it returns `409 TASK_VERSION_CONFLICT` and the current safe task fields. Comments can be listed by project members, added by non-viewers, and deleted by their author or the assigned project manager/admin. Admin and project management endpoints are described below.
 
@@ -48,7 +58,7 @@ Task reads include a numeric `version`. A PATCH must send the version it read. T
 - Admins and assigned Project Managers can update/archive projects, manage project memberships and scoped membership roles, and create/delete tasks. Manager reassignment remains Admin-only.
 - Team Members can read member projects, update tasks assigned to them using the required current `version`, and add comments. Viewers can read project/task/comment data but cannot mutate it.
 - Users can list comments; a comment author or the assigned Project Manager/Admin can delete a comment. Inactive accounts are rejected on protected requests.
-- The dashboard includes project and task creation, project rename/archive/delete controls, member role controls, task status/deletion controls, comments, and Admin user create/deactivate controls. API authorization remains authoritative.
+- The routed workspace includes project and task creation, project rename/archive/delete controls, member role controls, task status/deletion controls, comments, and Admin user create/deactivate controls. API authorization remains authoritative.
 
 ## Local setup
 
@@ -75,4 +85,4 @@ The frontend is at http://localhost:3000. The API health endpoint is http://loca
 
 Seeded demo credentials (all use `NeoStats123!`): Admin `admin@neostats.local`; Project Manager `manager@neostats.local`; Team Member `member@neostats.local`; Viewer `viewer@neostats.local`.
 
-Membership roles (`MANAGER`, `MEMBER`, `VIEWER`) are project-scoped and never grant global privileges. Current limitations: this UI is a compact single-page dashboard; priority, due dates, labels, subtasks, activity history, notifications, and Kanban are not implemented. Team Members receive only their assigned tasks in project task responses. Task changes require a version and stale writes return 409 `TASK_VERSION_CONFLICT`.
+Membership roles (`MANAGER`, `MEMBER`, `VIEWER`) are project-scoped and never grant global privileges. Current limitations: priority, due dates, labels, subtasks, activity history, notifications, and Kanban are not implemented. Team Members receive only their assigned tasks in project task responses. Task changes require a version and stale writes return 409 `TASK_VERSION_CONFLICT`.
