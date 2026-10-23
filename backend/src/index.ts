@@ -220,7 +220,8 @@ app.post("/api/users", auth, async (req: AuthReq, res) => {
   const b = z.object({ name: z.string().min(1).max(100), email: z.string().email(), password: z.string().min(10), role: z.enum([Role.ADMIN, Role.PROJECT_MANAGER, Role.TEAM_MEMBER, Role.VIEWER]) }).safeParse(req.body);
   if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
   if (await prisma.user.findUnique({ where: { email: b.data.email } })) return res.status(409).json({ error: "EMAIL_EXISTS" });
-  const user = await prisma.user.create({ data: { ...b.data, passwordHash: await bcrypt.hash(b.data.password, 10) }, select: { id: true, name: true, email: true, role: true, active: true } });
+  const { password, ...fields } = b.data;
+  const user = await prisma.user.create({ data: { ...fields, passwordHash: await bcrypt.hash(password, 10) }, select: { id: true, name: true, email: true, role: true, active: true } });
   res.status(201).json(user);
 });
 app.patch("/api/users/:id", auth, async (req: AuthReq, res) => {
