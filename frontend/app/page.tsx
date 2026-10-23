@@ -55,6 +55,8 @@ class ApiError extends Error {
 
 function messageFor(error: unknown) {
   if (!(error instanceof ApiError)) return "Could not reach NeoStats. Check that the API is running and try again.";
+  if (error.code === "REQUEST_TIMEOUT") return "The API did not respond within 12 seconds. Check that the backend is running, then try again.";
+  if (error.code === "NETWORK_ERROR") return "Could not reach the API. Check that the backend is running and try again.";
   const messages: Record<string, string> = {
     INVALID_CREDENTIALS: "Email or password is incorrect.",
     UNAUTHENTICATED: "Your session has expired. Please sign in again.",
@@ -72,22 +74,28 @@ function messageFor(error: unknown) {
 }
 
 async function request<T>(path: string, method = "GET", body?: unknown): Promise<T> {
-  let response: Response;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 12000);
   try {
-    response = await fetch(`${API}${path}`, {
+    const response = await fetch(`${API}${path}`, {
       method,
       credentials: "include",
       headers: body === undefined ? undefined : { "Content-Type": "application/json" },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
     });
-  } catch {
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new ApiError(response.status, data.error || `HTTP_${response.status}`);
+    }
+    return (response.status === 204 ? null : await response.json()) as T;
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (controller.signal.aborted) throw new ApiError(0, "REQUEST_TIMEOUT");
     throw new ApiError(0, "NETWORK_ERROR");
+  } finally {
+    window.clearTimeout(timeout);
   }
-  if (!response.ok) {
-    const data = await response.json().catch(() => ({}));
-    throw new ApiError(response.status, data.error || `HTTP_${response.status}`);
-  }
-  return (response.status === 204 ? null : response.json()) as Promise<T>;
 }
 
 function initials(name: string) {
@@ -281,9 +289,9 @@ export default function Home() {
       <form onSubmit={login} className="stack-form"><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" required /></label><button className="button button-primary button-full" disabled={busy}>{busy ? "Signing in…" : "Sign in"}<span>→</span></button></form><div className="login-help">Demo accounts are documented in the project README.</div></div></section></main>;
 
   return <main className="app-shell">
-    <aside className="sidebar"><div className="brand-lockup"><span className="brand-mark">N</span><span>NeoStats</span></div><div className="workspace-switch"><span className="workspace-icon">N</span><span><small>WORKSPACE</small><b>NeoStats team</b></span><span className="chevron">⌄</span></div><nav className="side-nav" aria-label="Main navigation"><span className="nav-label">WORKSPACE</span>{(["Overview", "Projects", "Tasks", "Team"] as View[]).map((item) => <button key={item} className={`nav-item ${view === item ? "active" : ""}`} onClick={() => setView(item)}><span className="nav-icon">{{ Overview: "▦", Projects: "▤", Tasks: "✓", Team: "♧", Admin: "⚙" }[item]}</span>{item}{item === "Tasks" && <span className="nav-count">{totalTasks}</span>}</button>)}{isAdmin && <><span className="nav-label nav-label-spaced">MANAGE</span><button className={`nav-item ${view === "Admin" ? "active" : ""}`} onClick={() => setView("Admin")}><span className="nav-icon">⚙</span>Administration</button></>}</nav><div className="sidebar-bottom"><div className="help-card"><span className="help-icon">?</span><b>Need a hand?</b><p>Check the project README for setup and demo account details.</p></div><div className="sidebar-user"><span className="avatar">{initials(user.name)}</span><span className="sidebar-user-copy"><b>{user.name}</b><small>{user.role.replaceAll("_", " ")}</small></span><button className="icon-button sidebar-menu" aria-label="Sign out" title="Sign out" onClick={logout}>⋯</button></div></div></aside>
+    <aside className="sidebar"><div className="brand-lockup"><span className="brand-mark">N</span><span>NeoStats</span></div><div className="workspace-switch"><span className="workspace-icon">N</span><span><small>WORKSPACE</small><b>NeoStats team</b></span><span className="chevron">⌄</span></div><nav className="side-nav" aria-label="Main navigation"><span className="nav-label">WORKSPACE</span>{(["Overview", "Projects", "Tasks", "Team"] as View[]).map((item) => <button key={item} className={`nav-item ${view === item ? "active" : ""}`} onClick={() => setView(item)}><span className="nav-icon">{{ Overview: "▦", Projects: "▤", Tasks: "✓", Team: "♧", Admin: "⚙" }[item]}</span>{item}{item === "Tasks" && <span className="nav-count">{totalTasks}</span>}</button>)}{isAdmin && <><span className="nav-label nav-label-spaced">MANAGE</span><button className={`nav-item ${view === "Admin" ? "active" : ""}`} onClick={() => setView("Admin")}><span className="nav-icon">⚙</span>Administration</button></>}</nav><div className="sidebar-bottom"><div className="help-card"><span className="help-icon">?</span><b>Need a hand?</b><p>Check the project README for setup and demo account details.</p></div><div className="sidebar-user"><span className="avatar">{initials(user.name)}</span><span className="sidebar-user-copy"><b>{user.name}</b><small>{user.role.replaceAll("_", " ")}</small></span></div></div></aside>
 
-    <section className="main-panel"><header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b><strong>{view}</strong></div><div className="topbar-actions"><label className="search-box"><span>⌕</span><input aria-label="Search projects and tasks" placeholder="Search projects and tasks…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="topbar-divider" /><button className="profile-chip" type="button" onClick={logout} title="Sign out"><span className="avatar avatar-small">{initials(user.name)}</span><span>{user.name}</span><span className="chevron">⌄</span></button></div></header>
+    <section className="main-panel"><header className="topbar"><div className="breadcrumb"><span>Workspace</span><b>/</b><strong>{view}</strong></div><div className="topbar-actions"><label className="search-box"><span>⌕</span><input aria-label="Search projects and tasks" placeholder="Search projects and tasks…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="topbar-divider" /><div className="profile-chip"><span className="avatar avatar-small">{initials(user.name)}</span><span>{user.name}</span><button className="text-button" type="button" onClick={logout} disabled={busy}>Sign out</button></div></div></header>
 
     <div className="page-content">{error && <div className="alert alert-error global-alert" role="alert"><span>!</span>{error}<button className="alert-close" onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}{notice && <div className="alert alert-success global-alert" role="status"><span>✓</span>{notice}<button className="alert-close" onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
       {loading && <div className="loading-strip"><span className="spinner" /> Syncing workspace…</div>}
