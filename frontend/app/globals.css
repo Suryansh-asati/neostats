@@ -65,6 +65,7 @@ input, select { color: var(--ink); }
 .topbar-divider { height: 30px; border-left: 1px solid var(--line); }
 .profile-chip { display: flex; align-items: center; gap: 12px; border: 0; background: transparent; color: #3f4a5c; font-size: 16px; font-weight: 600; }
 .page-content { max-width: 1768px; min-height: calc(100vh - 88px); margin: 0 auto; padding: 48px 55px 33px; }
+.dashboard-content { max-width: 1440px; }
 .section-heading { margin: 0 0 33px; display: flex; align-items: flex-end; justify-content: space-between; gap: 23px; }
 .eyebrow { margin-bottom: 10px; color: #7e8aa0; font-size: 12px; font-weight: 700; letter-spacing: 1.35px; }
 .section-heading h1 { margin: 0; font-family: Manrope, sans-serif; font-size: clamp(33px, 2.6vw, 40px); font-weight: 750; letter-spacing: -1px; line-height: 1.2; }
@@ -201,3 +202,10 @@ input, select { color: var(--ink); }
   .member-row select { max-width: 100%; }
   .user-row > summary { grid-template-columns: minmax(0, 1fr) auto; }
 }
+
+.account-id-inline { display: block; margin-top: 4px; color: #8994a5; font-size: 11px; }
+.account-id-inline code { color: #68758a; font-size: 10px; overflow-wrap: anywhere; }
+.password-input { position: relative; display: block; }
+.password-input input { padding-right: 72px; }
+.password-toggle { position: absolute; top: 50%; right: 10px; transform: translateY(-50%); padding: 6px 8px; border: 0; border-radius: 4px; background: transparent; color: var(--blue); font-size: 12px; font-weight: 600; }
+.password-toggle:hover { background: #f1f3fc; }
