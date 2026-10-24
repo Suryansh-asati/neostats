@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
@@ -17,7 +17,15 @@ type User = {
 type Comment = {
   id: string;
   body: string;
+  createdAt: string;
   author: { id: string; name: string };
+};
+type TaskActivity = {
+  id: string;
+  eventType: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+  actor: { id: string; name: string } | null;
 };
 type Task = {
   id: string;
@@ -25,6 +33,7 @@ type Task = {
   description: string;
   status: "TODO" | "IN_PROGRESS" | "DONE";
   version: number;
+  updatedAt?: string;
   assigneeId?: string | null;
   assignee?: { id: string; name: string } | null;
   comments?: Comment[];
@@ -39,11 +48,20 @@ type Project = {
   name: string;
   description: string;
   archived?: boolean;
+  createdAt?: string;
   manager: { id: string; name: string };
   memberships?: Membership[];
   tasks: Task[];
 };
-type View = "Overview" | "Projects" | "Tasks" | "Team" | "Admin";
+type View = "Overview" | "Projects" | "Board" | "Tasks" | "TaskDetail" | "Team" | "Admin";
+type RecentWork = {
+  id: string;
+  kind: "task" | "project";
+  title: string;
+  projectName: string;
+  timestamp: string;
+  projectId?: string;
+};
 
 class ApiError extends Error {
   status: number;
@@ -104,9 +122,47 @@ function initials(name: string) {
   return name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]).join("").toUpperCase();
 }
 
+function decodeRouteSegment(value: string) {
+  try { return decodeURIComponent(value); }
+  catch { return value; }
+}
+
 function StatusPill({ status }: { status: Task["status"] }) {
   const label = status === "TODO" ? "To do" : status === "IN_PROGRESS" ? "In progress" : "Done";
   return <span className={`status-pill status-${status.toLowerCase()}`}><i />{label}</span>;
+}
+
+const TASK_STATUSES: Task["status"][] = ["TODO", "IN_PROGRESS", "DONE"];
+const STATUS_LABELS: Record<Task["status"], string> = { TODO: "To Do", IN_PROGRESS: "In Progress", DONE: "Done" };
+
+function canChangeTaskStatus(user: User, project: Project, task: Task) {
+  if (user.role === "VIEWER") return false;
+  const scopedManager = (project.memberships || []).some((member) => member.userId === user.id && member.role === "MANAGER");
+  const managesProject = user.role === "ADMIN" || project.manager.id === user.id ||
+    ((user.role === "PROJECT_MANAGER" || user.role === "TEAM_MEMBER") && scopedManager);
+  return managesProject || (user.role === "TEAM_MEMBER" && (task.assigneeId === user.id || task.assignee?.id === user.id));
+}
+
+function canManageTaskAssignment(user: User, project: Project) {
+  const scopedManager = (project.memberships || []).some((member) => member.userId === user.id && member.role === "MANAGER");
+  return user.role === "ADMIN" || project.manager.id === user.id ||
+    ((user.role === "PROJECT_MANAGER" || user.role === "TEAM_MEMBER") && scopedManager);
+}
+
+function activitySummary(activity: TaskActivity) {
+  const details = activity.details?.changes as Record<string, { from?: unknown; to?: unknown }> | undefined;
+  if (activity.eventType === "TASK_CREATED") return "created the task";
+  if (activity.eventType === "COMMENT_ADDED") return "added a comment";
+  if (activity.eventType === "TASK_STATUS_CHANGED" && details?.status) {
+    const statusName = (value: unknown) => value === "TODO" ? "To Do" : value === "IN_PROGRESS" ? "In Progress" : value === "DONE" ? "Done" : String(value);
+    return `changed status from ${statusName(details.status.from)} to ${statusName(details.status.to)}`;
+  }
+  if (activity.eventType === "TASK_ASSIGNEE_CHANGED" && details?.assignee) return `changed assignee from ${String(details.assignee.from)} to ${String(details.assignee.to)}`;
+  if (activity.eventType === "TASK_DETAILS_CHANGED") {
+    const fields = Object.keys(details || {}).map((key) => key === "title" ? "title" : key === "description" ? "description" : key);
+    return `updated ${fields.join(" and ") || "task details"}`;
+  }
+  return "updated the task";
 }
 
 function EmptyState({ title, text }: { title: string; text: string }) {
@@ -115,6 +171,26 @@ function EmptyState({ title, text }: { title: string; text: string }) {
 
 function SectionHeading({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) {
   return <div className="section-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action}</div>;
+}
+
+function formatDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Date unavailable";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric" }).format(date);
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Date unavailable";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+}
+
+function DashboardSkeleton() {
+  return <div className="dashboard-skeleton" role="status" aria-label="Loading dashboard analytics">
+    <span className="sr-only">Loading dashboard analytics…</span>
+    <div className="summary-grid">{[0, 1, 2, 3].map((item) => <div className="summary-card skeleton-block" key={item} />)}</div>
+    <div className="analytics-grid"><div className="surface-card skeleton-panel" /><div className="surface-card skeleton-panel" /><div className="surface-card skeleton-panel skeleton-wide" /></div>
+  </div>;
 }
 
 function TaskCard({
@@ -156,7 +232,7 @@ function TaskCard({
 
   return (
     <article className="task-card">
-      <div className="task-topline"><div className="task-title-wrap"><span className="task-mark">✓</span><div><h3>{task.title}</h3><p className="task-project-name">{project.name}</p></div></div><StatusPill status={task.status} /></div>
+      <div className="task-topline"><div className="task-title-wrap"><span className="task-mark">✓</span><div><h3><Link className="task-detail-link" href={`/tasks/${encodeURIComponent(task.id)}`}>{task.title}</Link></h3><p className="task-project-name"><Link href={`/projects/${encodeURIComponent(project.id)}`}>{project.name}</Link></p></div></div><StatusPill status={task.status} /></div>
       {task.description && <p className="task-description">{task.description}</p>}
       <div className="task-meta"><span className="avatar avatar-small">{initials(task.assignee?.name || "Unassigned")}</span><span>{task.assignee?.name || "Unassigned"}</span><span className="meta-divider" /> <span>Version {task.version}</span></div>
 
@@ -186,14 +262,18 @@ function TaskCard({
 export default function Home() {
   const pathname = usePathname();
   const router = useRouter();
+  const taskRoute = pathname.match(/^\/tasks\/([^/]+)$/);
+  const taskId = taskRoute ? decodeRouteSegment(taskRoute[1]) : null;
   const view: View = pathname === "/dashboard" ? "Overview"
     : pathname === "/projects" || pathname.startsWith("/projects/") ? "Projects"
+    : pathname === "/board" ? "Board"
     : pathname === "/tasks" ? "Tasks"
+    : taskRoute ? "TaskDetail"
     : pathname === "/team" ? "Team"
     : pathname === "/admin/users" ? "Admin"
     : "Overview";
   const projectRoute = pathname.match(/^\/projects\/([^/]+)$/);
-  const projectId = projectRoute ? decodeURIComponent(projectRoute[1]) : null;
+  const projectId = projectRoute ? decodeRouteSegment(projectRoute[1]) : null;
   const [user, setUser] = useState<User | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectDetail, setProjectDetail] = useState<Project | null>(null);
@@ -205,9 +285,25 @@ export default function Home() {
   const [showPassword, setShowPassword] = useState(false);
   const [booting, setBooting] = useState(true);
   const [loading, setLoading] = useState(false);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [boardSearch, setBoardSearch] = useState("");
+  const [boardProjectFilter, setBoardProjectFilter] = useState("ALL");
+  const [boardAssigneeFilter, setBoardAssigneeFilter] = useState("ALL");
+  const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
+  const [dropTargetStatus, setDropTargetStatus] = useState<Task["status"] | null>(null);
+  const [savingTaskId, setSavingTaskId] = useState<string | null>(null);
+  const [activity, setActivity] = useState<TaskActivity[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState("");
+  const [editingTask, setEditingTask] = useState(false);
+  const [taskTitleDraft, setTaskTitleDraft] = useState("");
+  const [taskDescriptionDraft, setTaskDescriptionDraft] = useState("");
+  const [taskAssigneeDraft, setTaskAssigneeDraft] = useState("");
+  const [commentDraft, setCommentDraft] = useState("");
+  const statusUpdateInFlight = useRef(false);
 
   const isAdmin = user?.role === "ADMIN";
   const canManageProject = (project: Project) => isAdmin || project.manager.id === user?.id;
@@ -217,14 +313,82 @@ export default function Home() {
   }), [projects, query]);
   const tasks = useMemo(() => visibleProjects.flatMap((project) => project.tasks.map((task) => ({ ...task, project })))
     .filter(({ status }) => statusFilter === "ALL" || status === statusFilter), [visibleProjects, statusFilter]);
+  const accessibleTasks = useMemo(() => projects.flatMap((project) => project.tasks.map((task) => ({ task, project }))), [projects]);
+  const taskDetail = taskId ? accessibleTasks.find(({ task }) => task.id === taskId) || null : null;
+  const boardAssignees = useMemo(() => {
+    const unique = new Map<string, string>();
+    for (const { task } of accessibleTasks) {
+      const id = task.assignee?.id || task.assigneeId || "UNASSIGNED";
+      unique.set(id, task.assignee?.name || "Unassigned");
+    }
+    return [...unique.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  }, [accessibleTasks]);
+  const filteredBoardTasks = useMemo(() => {
+    const search = boardSearch.trim().toLowerCase();
+    return accessibleTasks.filter(({ task, project }) => {
+      const assigneeId = task.assignee?.id || task.assigneeId || "UNASSIGNED";
+      return (boardProjectFilter === "ALL" || project.id === boardProjectFilter) &&
+        (boardAssigneeFilter === "ALL" || assigneeId === boardAssigneeFilter) &&
+        (!search || task.title.toLowerCase().includes(search));
+    });
+  }, [accessibleTasks, boardAssigneeFilter, boardProjectFilter, boardSearch]);
   const totalTasks = projects.reduce((total, project) => total + project.tasks.length, 0);
-  const openTasks = projects.reduce((total, project) => total + project.tasks.filter((task) => task.status !== "DONE").length, 0);
-  const completedTasks = totalTasks - openTasks;
+  const dashboardAnalytics = useMemo(() => {
+    const visibleTasks = projects.flatMap((project) => project.tasks.map((task) => ({ task, project })));
+    const statusCounts: Record<Task["status"], number> = { TODO: 0, IN_PROGRESS: 0, DONE: 0 };
+    const workloadByAssignee = new Map<string, { id: string; name: string; count: number }>();
+    for (const { task } of visibleTasks) {
+      statusCounts[task.status] += 1;
+      const id = task.assignee?.id || "unassigned";
+      const name = task.assignee?.name || "Unassigned";
+      const current = workloadByAssignee.get(id);
+      if (current) current.count += 1;
+      else workloadByAssignee.set(id, { id, name, count: 1 });
+    }
+    const workload = [...workloadByAssignee.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+    const recentWork: RecentWork[] = [
+      ...visibleTasks.flatMap(({ task, project }) => task.updatedAt ? [{ id: `task-${task.id}`, kind: "task" as const, title: task.title, projectName: project.name, timestamp: task.updatedAt }] : []),
+      ...projects.flatMap((project) => project.createdAt ? [{ id: `project-${project.id}`, kind: "project" as const, title: project.name, projectName: project.name, timestamp: project.createdAt, projectId: project.id }] : []),
+    ].filter((item) => !Number.isNaN(Date.parse(item.timestamp)))
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+      .slice(0, 6);
+    const activeProjects = projects.filter((project) => !project.archived).length;
+    return {
+      totalProjects: projects.length,
+      activeProjects,
+      archivedProjects: projects.length - activeProjects,
+      totalTasks: visibleTasks.length,
+      statusCounts,
+      completion: visibleTasks.length ? Math.round(statusCounts.DONE / visibleTasks.length * 100) : 0,
+      workload,
+      recentWork,
+    };
+  }, [projects]);
+  const maxWorkload = Math.max(0, ...dashboardAnalytics.workload.map((person) => person.count));
 
   async function loadData(activeUser: User, activePath = pathname, isCurrent: () => boolean = () => true) {
     const data = await request<Project[]>("/api/projects");
     if (!isCurrent()) return;
     setProjects(data);
+    setProjectsLoaded(true);
+    const taskRoute = activePath.match(/^\/tasks\/([^/]+)$/);
+    const taskId = taskRoute ? decodeRouteSegment(taskRoute[1]) : null;
+    const taskIsVisible = taskId ? data.some((project) => project.tasks.some((task) => task.id === taskId)) : false;
+    setActivity([]);
+    setActivityError("");
+    if (taskIsVisible) {
+      setActivityLoading(true);
+      try {
+        const events = await request<TaskActivity[]>(`/api/tasks/${encodeURIComponent(taskId!)}/activity`);
+        if (isCurrent()) setActivity(events);
+      } catch (reason) {
+        if (isCurrent()) setActivityError(messageFor(reason));
+      } finally {
+        if (isCurrent()) setActivityLoading(false);
+      }
+    } else {
+      setActivityLoading(false);
+    }
     if (activeUser.role === "ADMIN") {
       const accounts = await request<User[]>("/api/users");
       if (!isCurrent()) return;
@@ -232,7 +396,7 @@ export default function Home() {
     }
     else setUsers([]);
     const detailRoute = activePath.match(/^\/projects\/([^/]+)$/);
-    const detailId = detailRoute ? decodeURIComponent(detailRoute[1]) : null;
+    const detailId = detailRoute ? decodeRouteSegment(detailRoute[1]) : null;
     const detail = detailId ? await request<Project>(`/api/projects/${encodeURIComponent(detailId)}`) : null;
     if (isCurrent()) setProjectDetail(detail);
   }
@@ -273,12 +437,71 @@ export default function Home() {
   }, [pathname, user]);
 
   useEffect(() => {
-    const pageName = projectDetail?.name || (view === "Overview" ? "Dashboard" : view === "Admin" ? "Admin users" : view);
+    const pageName = projectDetail?.name || (view === "TaskDetail" ? taskDetail?.task.title || "Task" : view === "Overview" ? "Dashboard" : view === "Admin" ? "Admin users" : view);
     document.title = `${user ? pageName : "Sign in"} | FlowForge`;
-  }, [projectDetail?.name, user, view]);
+  }, [projectDetail?.name, taskDetail?.task.title, user, view]);
+
+  useEffect(() => {
+    if (!taskDetail) return;
+    setTaskTitleDraft(taskDetail.task.title);
+    setTaskDescriptionDraft(taskDetail.task.description);
+    setTaskAssigneeDraft(taskDetail.task.assigneeId || taskDetail.task.assignee?.id || "");
+  }, [taskDetail?.task.id, taskDetail?.task.version]);
 
   async function refresh() {
     if (user) await loadData(user, pathname);
+  }
+
+  async function retryWorkspaceLoad() {
+    if (!user) return;
+    setLoading(true);
+    setError("");
+    try { await loadData(user, pathname); }
+    catch (reason) { setError(messageFor(reason)); }
+    finally { setLoading(false); }
+  }
+
+  async function changeTaskStatus(project: Project, task: Task, status: Task["status"]) {
+    if (!user || status === task.status || busy || statusUpdateInFlight.current || !canChangeTaskStatus(user, project, task)) return false;
+    statusUpdateInFlight.current = true;
+    setSavingTaskId(task.id);
+    setDraggedTaskId(null);
+    setDropTargetStatus(null);
+    try {
+      return await mutate("Task status updated.", () => request(`/api/tasks/${encodeURIComponent(task.id)}`, "PATCH", { status, version: task.version }));
+    } finally {
+      statusUpdateInFlight.current = false;
+      setSavingTaskId(null);
+    }
+  }
+
+  async function saveTaskDetails(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!taskDetail || !user) return;
+    const payload: Record<string, unknown> = {
+      title: taskTitleDraft.trim(),
+      description: taskDescriptionDraft,
+      version: taskDetail.task.version,
+    };
+    if (canManageTaskAssignment(user, taskDetail.project)) payload.assigneeId = taskAssigneeDraft || null;
+    const saved = await mutate("Task details updated.", () => request(`/api/tasks/${encodeURIComponent(taskDetail.task.id)}`, "PATCH", payload));
+    if (saved) setEditingTask(false);
+  }
+
+  async function addTaskComment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!taskDetail || !commentDraft.trim()) return;
+    const saved = await mutate("Comment added.", () => request(`/api/tasks/${encodeURIComponent(taskDetail.task.id)}/comments`, "POST", { body: commentDraft.trim() }));
+    if (saved) setCommentDraft("");
+  }
+
+  async function retryActivity() {
+    if (!taskDetail) return;
+    setActivityLoading(true);
+    setActivityError("");
+    try { setActivity(await request<TaskActivity[]>(`/api/tasks/${encodeURIComponent(taskDetail.task.id)}/activity`)); }
+    catch (reason) { setActivityError(messageFor(reason)); }
+    finally { setActivityLoading(false); }
   }
 
   async function mutate(label: string, action: () => Promise<unknown>) {
@@ -306,7 +529,7 @@ export default function Home() {
 
   async function logout() {
     setBusy(true); setError("");
-    try { await request<null>("/api/auth/logout", "POST"); setUser(null); setProjects([]); setProjectDetail(null); setUsers([]); setNotice(""); router.replace("/"); }
+    try { await request<null>("/api/auth/logout", "POST"); setUser(null); setProjects([]); setProjectsLoaded(false); setProjectDetail(null); setUsers([]); setNotice(""); router.replace("/"); }
     catch (reason) { setError(messageFor(reason)); }
     finally { setBusy(false); }
   }
@@ -333,20 +556,39 @@ export default function Home() {
       <form onSubmit={login} className="stack-form"><label>Email address<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" required /></label><label>Password<span className="password-input"><input type={showPassword ? "text" : "password"} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Enter your password" required /><button type="button" className="password-toggle" aria-label={showPassword ? "Hide password" : "Show password"} aria-pressed={showPassword} onClick={() => setShowPassword((visible) => !visible)}>{showPassword ? "Hide" : "Show"}</button></span></label><button className="button button-primary button-full" disabled={busy}>{busy ? "Signing in…" : "Sign in"}<span>→</span></button></form><div className="login-help">Demo accounts are documented in the project README.</div></div></section></main>;
 
   return <main className="app-shell">
-    <aside className="sidebar"><div className="brand-lockup"><span className="brand-mark">F</span><span>FlowForge</span></div><div className="workspace-switch"><span className="workspace-icon">F</span><span><small>WORKSPACE</small><b>FlowForge</b></span><span className="chevron">⌄</span></div><nav className="side-nav" aria-label="Main navigation"><span className="nav-label">WORKSPACE</span>{([['Overview', '/dashboard', '\u25a6'], ['Projects', '/projects', '\u25a4'], ['Tasks', '/tasks', '\u2713'], ['Team', '/team', '\u2667']] as const).map(([item, href, icon]) => <Link key={item} href={href} className={`nav-item ${view === item ? "active" : ""}`}><span className="nav-icon">{icon}</span>{item}{item === "Tasks" && <span className="nav-count">{totalTasks}</span>}</Link>)}{isAdmin && <><span className="nav-label nav-label-spaced">MANAGE</span><Link href="/admin/users" className={`nav-item ${view === "Admin" ? "active" : ""}`}><span className="nav-icon">{String.fromCharCode(0x2699)}</span>Administration</Link></>}</nav><div className="sidebar-bottom"><div className="help-card"><span className="help-icon">?</span><b>Need a hand?</b><p>Check the project README for setup and demo account details.</p></div><div className="sidebar-user"><span className="avatar">{initials(user.name)}</span><span className="sidebar-user-copy"><b>{user.name}</b><small>{user.role.replaceAll("_", " ")}</small></span></div></div></aside>
+    <aside className="sidebar"><div className="brand-lockup"><span className="brand-mark">F</span><span>FlowForge</span></div><div className="workspace-switch"><span className="workspace-icon">F</span><span><small>WORKSPACE</small><b>FlowForge</b></span><span className="chevron">⌄</span></div><nav className="side-nav" aria-label="Main navigation"><span className="nav-label">WORKSPACE</span>{([['Overview', '/dashboard', '\u25a6'], ['Projects', '/projects', '\u25a4'], ['Tasks', '/tasks', '\u2713'], ['Team', '/team', '\u2667']] as const).map(([item, href, icon]) => <Link key={item} href={href} className={`nav-item ${view === item ? "active" : ""}`}><span className="nav-icon">{icon}</span>{item}{item === "Tasks" && <span className="nav-count">{totalTasks}</span>}</Link>)}{isAdmin && <><span className="nav-label nav-label-spaced">MANAGE</span><Link href="/admin/users" className={`nav-item ${view === "Admin" ? "active" : ""}`}><span className="nav-icon">{String.fromCharCode(0x2699)}</span>Administration</Link></>}<Link href="/board" className={`nav-item ${view === "Board" ? "active" : ""}`}><span className="nav-icon">▦</span>Board</Link></nav><div className="sidebar-bottom"><div className="help-card"><span className="help-icon">?</span><b>Need a hand?</b><p>Check the project README for setup and demo account details.</p></div><div className="sidebar-user"><span className="avatar">{initials(user.name)}</span><span className="sidebar-user-copy"><b>{user.name}</b><small>{user.role.replaceAll("_", " ")}</small></span></div></div></aside>
 
     <section className="main-panel"><header className="topbar"><div className="breadcrumb"><Link href="/dashboard">FlowForge</Link><b>/</b><strong>{projectDetail?.name || (view === "Overview" ? "Dashboard" : view === "Admin" ? "Admin users" : view)}</strong></div><div className="topbar-actions"><label className="search-box"><span>⌕</span><input aria-label="Search projects and tasks" placeholder="Search projects and tasks…" value={query} onChange={(event) => setQuery(event.target.value)} /></label><span className="topbar-divider" /><div className="profile-chip"><span className="avatar avatar-small">{initials(user.name)}</span><span>{user.name}</span><button className="text-button" type="button" onClick={logout} disabled={busy}>Sign out</button></div></div></header>
 
-    <div className={`page-content ${view === "Overview" ? "dashboard-content" : ""}`}>{error && <div className="alert alert-error global-alert" role="alert"><span>!</span>{error}<button className="alert-close" onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}{notice && <div className="alert alert-success global-alert" role="status"><span>✓</span>{notice}<button className="alert-close" onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
+    <div className={`page-content ${view === "Overview" ? "dashboard-content" : ""}`}>{error && <div className="alert alert-error global-alert" role="alert"><span>!</span>{error}{(view === "Overview" || view === "Board" || view === "TaskDetail") && <button className="button button-secondary button-small" type="button" onClick={retryWorkspaceLoad} disabled={loading}>Retry</button>}<button className="alert-close" onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}{notice && <div className="alert alert-success global-alert" role="status"><span>✓</span>{notice}<button className="alert-close" onClick={() => setNotice("")} aria-label="Dismiss message">×</button></div>}
       {loading && <div className="loading-strip"><span className="spinner" /> Syncing workspace…</div>}
 
       {view === "Overview" && <>
-        <SectionHeading eyebrow="YOUR WORKSPACE" title={`Good to see you, ${user.name.split(" ")[0]}`} description="Here’s the latest across your projects." action={isAdmin ? <button className="button button-primary" onClick={() => router.push("/projects")}>＋ New project</button> : undefined} />
-        <div className="summary-grid"><div className="summary-card"><span className="summary-icon icon-violet">▤</span><span className="summary-label">Projects</span><b>{projects.length}</b><small>Available to you</small></div><div className="summary-card"><span className="summary-icon icon-blue">◷</span><span className="summary-label">Open tasks</span><b>{openTasks}</b><small>Work in progress</small></div><div className="summary-card"><span className="summary-icon icon-green">✓</span><span className="summary-label">Completed</span><b>{completedTasks}</b><small>Across visible projects</small></div><div className="summary-card"><span className="summary-icon icon-amber">♧</span><span className="summary-label">Team members</span><b>{new Set(projects.flatMap((project) => (project.memberships || []).map((membership) => membership.userId))).size}</b><small>In your projects</small></div></div>
-        <div className="overview-grid"><section className="surface-card overview-projects"><div className="card-heading"><div><h2>Projects</h2><p>Your active workspaces</p></div><button className="text-button" onClick={() => router.push("/projects")}>View all →</button></div>{projects.filter((project) => !project.archived).slice(0, 4).map((project) => <Link className="project-list-row" key={project.id} href={`/projects/${project.id}`}><span className="project-avatar">{initials(project.name)}</span><span className="project-list-copy"><b>{project.name}</b><small>{project.manager.name} · {project.tasks.length} tasks</small></span><span className="progress-track"><i style={{ width: `${project.tasks.length ? Math.round(project.tasks.filter((task) => task.status === "DONE").length / project.tasks.length * 100) : 0}%` }} /></span><span className="progress-value">{project.tasks.length ? Math.round(project.tasks.filter((task) => task.status === "DONE").length / project.tasks.length * 100) : 0}%</span><span className="row-arrow">›</span></Link>)}{projects.filter((project) => !project.archived).length === 0 && <EmptyState title="Your workspace is ready" text="Projects you can access will appear here." />}</section>
-          <section className="surface-card overview-tasks"><div className="card-heading"><div><h2>Recent tasks</h2><p>Keep an eye on what’s moving</p></div><button className="text-button" onClick={() => router.push("/tasks")}>All tasks →</button></div>{projects.flatMap((project) => project.tasks.map((task) => ({ task, project }))).slice(0, 4).map(({ task, project }) => <Link className="recent-task-row" key={task.id} href="/tasks"><span className={`task-dot dot-${task.status.toLowerCase()}`} /><span className="recent-task-copy"><b>{task.title}</b><small>{project.name}</small></span><StatusPill status={task.status} /></Link>)}{totalTasks === 0 && <EmptyState title="No tasks to show" text="Tasks from your projects will appear here." />}</section></div>
+        <SectionHeading eyebrow="YOUR WORKSPACE" title={"Good to see you, " + user.name.split(" ")[0]} description="Here’s the latest across your projects." action={isAdmin ? <button className="button button-primary" onClick={() => router.push("/projects")}>＋ New project</button> : undefined} />
+        {!projectsLoaded ? loading ? <DashboardSkeleton /> : <section className="surface-card dashboard-unavailable"><h2>Dashboard data is unavailable</h2><p>Metrics will appear after FlowForge can load your authorized projects and tasks.</p><button className="button button-secondary button-small" type="button" onClick={retryWorkspaceLoad}>Try again</button></section> : <>
+          <div className="summary-grid analytics-summary">
+            <article className="summary-card"><span className="summary-icon icon-violet">▤</span><span className="summary-label">Visible projects</span><b>{dashboardAnalytics.totalProjects}</b><small>{dashboardAnalytics.activeProjects} active · {dashboardAnalytics.archivedProjects} archived</small></article>
+            <article className="summary-card"><span className="summary-icon icon-blue">◷</span><span className="summary-label">Active projects</span><b>{dashboardAnalytics.activeProjects}</b><small>Of {dashboardAnalytics.totalProjects} visible projects</small></article>
+            <article className="summary-card"><span className="summary-icon icon-green">✓</span><span className="summary-label">Visible tasks</span><b>{dashboardAnalytics.totalTasks}</b><small>{dashboardAnalytics.statusCounts.TODO} to do · {dashboardAnalytics.statusCounts.IN_PROGRESS} in progress</small></article>
+            <article className="summary-card"><span className="summary-icon icon-amber">%</span><span className="summary-label">Task completion</span><b>{dashboardAnalytics.totalTasks ? dashboardAnalytics.completion + "%" : "—"}</b><small>{dashboardAnalytics.totalTasks ? dashboardAnalytics.statusCounts.DONE + " of " + dashboardAnalytics.totalTasks + " tasks done" : "No tasks yet"}</small></article>
+          </div>
+          <div className="analytics-grid">
+            <section className="surface-card analytics-card" aria-labelledby="status-breakdown-title"><div className="card-heading"><div><h2 id="status-breakdown-title">Task status</h2><p>Visible tasks by current status</p></div><span className="analytics-total">{dashboardAnalytics.totalTasks} total</span></div>
+              <div className="status-breakdown">{([["TODO", "To do"], ["IN_PROGRESS", "In progress"], ["DONE", "Done"]] as const).map(([status, label]) => {
+                const count = dashboardAnalytics.statusCounts[status];
+                const percent = dashboardAnalytics.totalTasks ? Math.round(count / dashboardAnalytics.totalTasks * 100) : 0;
+                return <div className="status-breakdown-row" key={status}><div className="status-breakdown-label"><span className={"task-dot dot-" + status.toLowerCase()} /><b>{label}</b><span>{count}</span><small>{percent}%</small></div><div className="analytics-bar" role="img" aria-label={label + ": " + count + " tasks, " + percent + "%"}><i className={"analytics-fill fill-" + status.toLowerCase()} style={{ width: percent + "%" }} /></div></div>;
+              })}</div>
+            </section>
+            <section className="surface-card analytics-card" aria-labelledby="workload-title"><div className="card-heading"><div><h2 id="workload-title">Team workload</h2><p>Visible tasks grouped by assignee</p></div><span className="analytics-total">{dashboardAnalytics.workload.length} assignees</span></div>
+              {dashboardAnalytics.workload.length ? <div className="workload-list">{dashboardAnalytics.workload.map((person) => <div className="workload-row" key={person.id}><span className={"avatar avatar-small " + (person.id === "unassigned" ? "avatar-unassigned" : "")}>{person.id === "unassigned" ? "—" : initials(person.name)}</span><span className="workload-person"><b>{person.name}</b><span className="analytics-bar"><i style={{ width: (maxWorkload ? person.count / maxWorkload * 100 : 0) + "%" }} /></span></span><strong>{person.count}</strong></div>)}</div> : <EmptyState title="No task workload yet" text="Tasks will be grouped here when they are available." />}
+            </section>
+            <section className="surface-card analytics-card analytics-recent" aria-labelledby="recent-work-title"><div className="card-heading"><div><h2 id="recent-work-title">Recent work</h2><p>Projects created and tasks updated, ordered by available timestamps</p></div><button className="text-button" onClick={() => router.push("/tasks")}>View tasks →</button></div>
+              {dashboardAnalytics.recentWork.length ? <div className="recent-work-list">{dashboardAnalytics.recentWork.map((item) => <Link className="recent-work-row" key={item.id} href={item.kind === "task" ? "/tasks" : "/projects/" + encodeURIComponent(item.projectId || "")}><span className={"recent-work-icon " + (item.kind === "task" ? "recent-task-icon" : "recent-project-icon")}>{item.kind === "task" ? "✓" : "▤"}</span><span className="recent-work-copy"><b>{item.title}</b><small>{item.kind === "task" ? item.projectName + " · Task updated" : "Project created"}</small></span><time dateTime={item.timestamp}>{formatDate(item.timestamp)}</time></Link>)}</div> : <EmptyState title="No recent work yet" text="Projects and tasks with available timestamps will appear here." />}
+            </section>
+          </div>
+        </>}
       </>}
-
       {view === "Projects" && projectId && <>
         {loading && !projectDetail ? <div className="surface-card route-loading" role="status"><span className="spinner" /> Loading project details…</div> : projectDetail ? <>
           <SectionHeading eyebrow="PROJECT WORKSPACE" title={projectDetail.name} description={projectDetail.description || "Project details, team, tasks, and discussion."} action={<Link className="button button-secondary" href="/projects">All projects</Link>} />
@@ -375,6 +617,73 @@ export default function Home() {
         })}</div>}
       </>}
 
+      {view === "Board" && <>
+        <SectionHeading eyebrow="TASK FLOW" title="Kanban board" description="Move work through To Do, In Progress, and Done. Drag a card or use its status control." />
+        {!projectsLoaded ? loading ? <DashboardSkeleton /> : <section className="surface-card board-empty-state"><h2>Board data is unavailable</h2><p>Tasks will appear when FlowForge can load your authorized projects.</p><button className="button button-secondary button-small" type="button" onClick={retryWorkspaceLoad}>Try again</button></section> : <>
+          <section className="surface-card board-filters" aria-label="Filter board tasks">
+            <label>Search title<input type="search" value={boardSearch} onChange={(event) => setBoardSearch(event.target.value)} placeholder="Find a task…" /></label>
+            <label>Project<select value={boardProjectFilter} onChange={(event) => setBoardProjectFilter(event.target.value)}><option value="ALL">All projects</option>{projects.map((project) => <option key={project.id} value={project.id}>{project.name}</option>)}</select></label>
+            <label>Assignee<select value={boardAssigneeFilter} onChange={(event) => setBoardAssigneeFilter(event.target.value)}><option value="ALL">All assignees</option>{boardAssignees.map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>
+            <button className="button button-secondary button-small" type="button" disabled={!boardSearch && boardProjectFilter === "ALL" && boardAssigneeFilter === "ALL"} onClick={() => { setBoardSearch(""); setBoardProjectFilter("ALL"); setBoardAssigneeFilter("ALL"); }}>Reset filters</button>
+            <span className="board-result-count" aria-live="polite">{filteredBoardTasks.length} {filteredBoardTasks.length === 1 ? "task" : "tasks"}</span>
+          </section>
+          {accessibleTasks.length === 0 ? <div className="surface-card board-empty-state"><EmptyState title="No tasks on the board" text="Tasks from projects you can access will appear here." /></div> : filteredBoardTasks.length === 0 ? <div className="surface-card board-empty-state" role="status"><h2>No matching tasks</h2><p>Adjust or reset the project, assignee, or title filters.</p><button className="button button-secondary button-small" type="button" onClick={() => { setBoardSearch(""); setBoardProjectFilter("ALL"); setBoardAssigneeFilter("ALL"); }}>Reset filters</button></div> : null}
+          <div className="kanban-board" aria-label="Tasks by status">
+            {TASK_STATUSES.map((status) => {
+              const columnTasks = filteredBoardTasks.filter(({ task }) => task.status === status);
+              return <section className={"kanban-column" + (dropTargetStatus === status ? " drop-target" : "")} key={status} aria-labelledby={"kanban-" + status}>
+                <header className="kanban-column-heading"><div><span className={"task-dot dot-" + status.toLowerCase()} /><h2 id={"kanban-" + status}>{STATUS_LABELS[status]}</h2></div><span className="kanban-count">{columnTasks.length}</span></header>
+                <div className="kanban-card-list" onDragOver={(event) => { if (!draggedTaskId || busy) return; event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropTargetStatus(status); }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTargetStatus(null); }} onDrop={(event) => { event.preventDefault(); const id = event.dataTransfer.getData("text/plain") || draggedTaskId; setDraggedTaskId(null); setDropTargetStatus(null); const entry = filteredBoardTasks.find(({ task }) => task.id === id); if (entry) void changeTaskStatus(entry.project, entry.task, status); }}>
+                  {columnTasks.map(({ task, project }) => {
+                    const canMove = canChangeTaskStatus(user, project, task);
+                    const saving = savingTaskId === task.id;
+                    return <article className={"kanban-card" + (saving ? " is-saving" : "")} key={task.id} draggable={canMove && !busy} onDragStart={(event) => { if (!canMove || busy) { event.preventDefault(); return; } event.dataTransfer.setData("text/plain", task.id); event.dataTransfer.effectAllowed = "move"; setDraggedTaskId(task.id); }} onDragEnd={() => { setDraggedTaskId(null); setDropTargetStatus(null); }}>
+                      <div className="kanban-card-title-row"><Link className="kanban-task-title" href={"/tasks/" + encodeURIComponent(task.id)}>{task.title}</Link><StatusPill status={task.status} /></div>
+                      <Link className="kanban-project-link" href={"/projects/" + encodeURIComponent(project.id)}>{project.name}</Link>
+                      <div className="kanban-card-meta"><span className="avatar avatar-small">{initials(task.assignee?.name || "Unassigned")}</span><span>{task.assignee?.name || "Unassigned"}</span>{task.updatedAt && <time dateTime={task.updatedAt}>Updated {formatDate(task.updatedAt)}</time>}</div>
+                      {canMove && <label className="board-status-control">Move to<select aria-label={"Move " + task.title + " to status"} value={task.status} disabled={busy || saving} onChange={(event) => void changeTaskStatus(project, task, event.target.value as Task["status"])}>{TASK_STATUSES.map((option) => <option value={option} key={option}>{STATUS_LABELS[option]}</option>)}</select></label>}
+                      {saving && <span className="saving-task-indicator" role="status"><span className="spinner" /> Saving status…</span>}
+                    </article>;
+                  })}
+                  {columnTasks.length === 0 && <p className="kanban-column-empty">{accessibleTasks.length ? "No matching tasks." : "No tasks in this status."}</p>}
+                </div>
+              </section>;
+            })}
+          </div>
+        </>}
+      </>}
+
+      {view === "TaskDetail" && <>
+        <SectionHeading eyebrow="TASK DETAILS" title={taskDetail?.task.title || "Task"} description="Task information from the projects you can access." action={taskDetail ? <Link className="button button-secondary" href={"/projects/" + encodeURIComponent(taskDetail.project.id)}>Open project</Link> : undefined} />
+        {loading && !taskDetail ? <div className="surface-card route-loading" role="status"><span className="spinner" /> Loading task…</div> : error && !taskDetail ? <section className="surface-card board-empty-state"><h2>Could not load this task</h2><p>Retry to check whether the task is available to your account.</p><button className="button button-secondary button-small" type="button" onClick={retryWorkspaceLoad}>Try again</button></section> : taskDetail ? <>
+          <article className="surface-card task-detail-card">
+            <div className="task-detail-top"><StatusPill status={taskDetail.task.status} /><span>Version {taskDetail.task.version}</span>{canChangeTaskStatus(user, taskDetail.project, taskDetail.task) && !editingTask && <button className="button button-secondary button-small" type="button" onClick={() => setEditingTask(true)}>Edit task</button>}</div>
+            {!editingTask ? <>
+              <h2>{taskDetail.task.title}</h2>
+              <Link className="task-detail-project-link" href={"/projects/" + encodeURIComponent(taskDetail.project.id)}>{taskDetail.project.name}</Link>
+              <p className="task-detail-description">{taskDetail.task.description || "No description has been added."}</p>
+              <div className="task-detail-meta"><div><small>Assignee</small><span className="task-detail-assignee"><span className="avatar avatar-small">{initials(taskDetail.task.assignee?.name || "Unassigned")}</span>{taskDetail.task.assignee?.name || "Unassigned"}</span></div>{taskDetail.task.updatedAt && <div><small>Last updated</small><time dateTime={taskDetail.task.updatedAt}>{formatDateTime(taskDetail.task.updatedAt)}</time></div>}</div>
+            </> : <form className="task-edit-form" onSubmit={(event) => void saveTaskDetails(event)}>
+              <label>Title<input value={taskTitleDraft} onChange={(event) => setTaskTitleDraft(event.target.value)} maxLength={200} required /></label>
+              <label>Description<textarea value={taskDescriptionDraft} onChange={(event) => setTaskDescriptionDraft(event.target.value)} maxLength={2000} rows={5} /></label>
+              {canManageTaskAssignment(user, taskDetail.project) && <label>Assignee<select value={taskAssigneeDraft} onChange={(event) => setTaskAssigneeDraft(event.target.value)}><option value="">Unassigned</option>{(taskDetail.project.memberships || []).filter((membership) => membership.user.role === "TEAM_MEMBER").map((membership) => <option value={membership.userId} key={membership.userId}>{membership.user.name}</option>)}{taskDetail.task.assignee && !(taskDetail.project.memberships || []).some((membership) => membership.userId === taskDetail.task.assignee?.id) && <option value={taskDetail.task.assignee.id}>{taskDetail.task.assignee.name}</option>}</select></label>}
+              <div className="task-edit-actions"><button className="button button-primary button-small" disabled={busy}>{busy ? "Saving…" : "Save changes"}</button><button className="button button-secondary button-small" type="button" disabled={busy} onClick={() => { setEditingTask(false); setTaskTitleDraft(taskDetail.task.title); setTaskDescriptionDraft(taskDetail.task.description); setTaskAssigneeDraft(taskDetail.task.assigneeId || ""); }}>Cancel</button></div>
+            </form>}
+            {canChangeTaskStatus(user, taskDetail.project, taskDetail.task) && <label className="board-status-control task-detail-status">Update status<select aria-label="Update task status" value={taskDetail.task.status} disabled={busy} onChange={(event) => void changeTaskStatus(taskDetail.project, taskDetail.task, event.target.value as Task["status"])}>{TASK_STATUSES.map((option) => <option value={option} key={option}>{STATUS_LABELS[option]}</option>)}</select></label>}
+          </article>
+
+          <section className="surface-card task-detail-section">
+            <div className="card-heading"><div><h2>Comments</h2><p>Discussion on this task</p></div><span className="member-count">{taskDetail.task.comments?.length || 0}</span></div>
+            {(taskDetail.task.comments || []).length ? <ol className="task-comments">{[...(taskDetail.task.comments || [])].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)).map((comment) => <li className="task-comment" key={comment.id}><div className="task-comment-heading"><span className="avatar avatar-small">{initials(comment.author.name)}</span><b>{comment.author.name}</b><time dateTime={comment.createdAt}>{formatDateTime(comment.createdAt)}</time></div><p>{comment.body}</p></li>)}</ol> : <p className="task-section-empty">No comments yet.</p>}
+            {canChangeTaskStatus(user, taskDetail.project, taskDetail.task) && <form className="task-comment-form" onSubmit={(event) => void addTaskComment(event)}><label htmlFor="task-comment-input">Add a comment</label><textarea id="task-comment-input" value={commentDraft} onChange={(event) => setCommentDraft(event.target.value)} maxLength={2000} rows={3} placeholder="Write a comment…" required /><button className="button button-primary button-small" disabled={busy || !commentDraft.trim()}>{busy ? "Posting…" : "Post comment"}</button></form>}
+          </section>
+
+          <section className="surface-card task-detail-section task-activity-section">
+            <div className="card-heading"><div><h2>Activity</h2><p>Recorded changes to this task</p></div></div>
+            {activityLoading ? <div className="task-section-empty" role="status"><span className="spinner" /> Loading activity…</div> : activityError ? <div className="task-activity-error" role="alert"><p>{activityError}</p><button className="button button-secondary button-small" type="button" onClick={retryActivity}>Retry</button></div> : activity.length ? <ol className="task-activity-list">{activity.map((event) => <li className="task-activity-row" key={event.id}><span className="activity-marker" aria-hidden="true">•</span><div><p><b>{event.actor?.name || "Former user"}</b> {activitySummary(event)}</p><time dateTime={event.createdAt}>{formatDateTime(event.createdAt)}</time></div></li>)}</ol> : <p className="task-section-empty">No activity has been recorded for this task yet. History begins with actions made after activity tracking was added.</p>}
+          </section>
+        </> : <div className="surface-card board-empty-state"><EmptyState title="Task not found" text="This task may not exist, or your account may not have access to it." /></div>}
+      </>}
       {view === "Tasks" && <><SectionHeading eyebrow="KEEP WORK MOVING" title="Tasks" description="A clear view of the next steps across your projects." /><div className="task-toolbar"><div className="filter-tabs" role="group" aria-label="Filter tasks by status">{[["ALL", "All tasks"], ["TODO", "To do"], ["IN_PROGRESS", "In progress"], ["DONE", "Done"]].map(([value, label]) => <button key={value} className={statusFilter === value ? "selected" : ""} onClick={() => setStatusFilter(value)}>{label}{value === "ALL" && <span>{totalTasks}</span>}</button>)}</div><span className="task-result-count">{tasks.length} shown</span></div>{tasks.length === 0 ? <EmptyState title="Nothing on your task list" text={query || statusFilter !== "ALL" ? "Try clearing a filter or changing your search." : "When a task is assigned to you or added to your project, it will show up here."} /> : <div className="task-list">{tasks.map(({ project, ...task }) => <TaskCard key={`${task.id}-${task.version}`} task={task} project={project} user={user} busy={busy} canManageProject={canManageProject(project)} onUpdate={(current, data) => void mutate("Task updated.", () => request(`/api/tasks/${current.id}`, "PATCH", { ...data, version: current.version }))} onStatus={(current, status) => void mutate("Task status updated.", () => request(`/api/tasks/${current.id}`, "PATCH", { status, version: current.version }))} onDelete={(current) => { if (window.confirm(`Delete “${current.title}”? This cannot be undone.`)) void mutate("Task deleted.", () => request(`/api/tasks/${current.id}`, "DELETE")); }} onComment={(current, body) => mutate("Comment added.", () => request(`/api/tasks/${current.id}/comments`, "POST", { body }))} onDeleteComment={(comment) => { if (window.confirm("Delete this comment?")) void mutate("Comment deleted.", () => request(`/api/comments/${comment.id}`, "DELETE")); }} />)}</div>}</>}
 
       {view === "Team" && <><SectionHeading eyebrow="PEOPLE & ACCESS" title="Team" description="See who is part of each project and manage project-scoped roles." />{projects.length === 0 ? <EmptyState title="No project teams yet" text="Teams appear here when you have access to a project." /> : <div className="team-project-list">{projects.map((project) => <section className="surface-card team-project" key={project.id}><div className="team-project-heading"><span className="project-avatar">{initials(project.name)}</span><div><h2>{project.name}</h2><p>Project Manager: {project.manager.name}</p></div><span className="member-count">{project.memberships?.length || 0} members</span></div>{(project.memberships || []).length ? <div className="member-table"><div className="member-table-head"><span>MEMBER</span><span>ACCOUNT ROLE</span><span>PROJECT ROLE</span>{canManageProject(project) && <span>MANAGE</span>}</div>{project.memberships?.map((membership) => <div className="member-row" key={membership.userId}><span className="member-identity"><span className="avatar avatar-small">{initials(membership.user.name)}</span><span><b>{membership.user.name}</b><small>{membership.user.email}</small></span></span><span><span className={`role-label role-${membership.user.role.toLowerCase()}`}>{membership.user.role.replaceAll("_", " ")}</span></span>{canManageProject(project) ? <span><select aria-label={`Project role for ${membership.user.name}`} value={membership.role} disabled={busy} onChange={(event) => void mutate("Project role updated.", () => request(`/api/projects/${project.id}/members/${membership.userId}`, "PATCH", { role: event.target.value }))}><option value="MANAGER">Manager · project only</option><option value="MEMBER">Member</option><option value="VIEWER">Viewer</option></select></span> : <span><span className="project-role-pill">{membership.role}</span></span>}{canManageProject(project) && <span><button className="button button-danger-quiet button-small" disabled={busy} onClick={() => { if (window.confirm(`Remove ${membership.user.name} from ${project.name}?`)) void mutate("Member removed.", () => request(`/api/projects/${project.id}/members/${membership.userId}`, "DELETE")); }}>Remove</button></span>}</div>)}</div> : <p className="empty-members">No members have been added to this project yet.</p>}{canManageProject(project) && <form className="add-member-form" onSubmit={(event) => { event.preventDefault(); const formElement = event.currentTarget; const form = new FormData(formElement); void mutate("Member added to project.", () => request(`/api/projects/${project.id}/members`, "POST", { userId: form.get("userId"), role: form.get("role") })).then((saved) => { if (saved) formElement.reset(); }); }}><label>Member user ID<input name="userId" placeholder="Paste the user's account ID" required /></label><label>Project role<select name="role"><option value="MEMBER">Member</option><option value="VIEWER">Viewer</option><option value="MANAGER">Manager · project only</option></select></label><button className="button button-secondary button-small" disabled={busy}>＋ Add member</button><p>Project roles only affect this project; they do not change account permissions.</p></form>}</section>)}</div>}</>}

@@ -74,6 +74,8 @@ npm run prisma:migrate --prefix backend -- --name init
 npm run prisma:seed --prefix backend
 ```
 
+For later schema changes, run `npm run prisma:migrate --prefix backend` against the local PostgreSQL database to apply the checked-in migrations without resetting existing data. Step 4 adds the `TaskActivity` table in migration `202610240001_task_activity`; it does not backfill events for actions that occurred before activity tracking was added. Regenerate Prisma Client with `npm run prisma:generate --prefix backend` after schema changes; stop the backend first on Windows so its loaded query engine does not lock the generated binary.
+
 Run these in separate terminals:
 
 ```powershell

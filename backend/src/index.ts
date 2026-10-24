@@ -52,25 +52,47 @@ const auth = async (req: AuthReq, res: Response, next: NextFunction) => {
     return res.status(401).json({ error: "UNAUTHENTICATED" });
   }
 };
-const isManager = async (userId: string, role: Role, projectId: string) => {
-  if (role === Role.ADMIN) return true;
+// ProjectRole is scoped to one project. It never changes the authenticated
+// user's global role or grants access to global administration endpoints.
+const projectRole = async (userId: string, projectId: string) => {
   const p = await prisma.project.findUnique({
     where: { id: projectId },
-    select: { managerId: true },
+    select: { managerId: true, memberships: { where: { userId }, select: { role: true } } },
   });
-  return !!p && p.managerId === userId;
+  if (!p) return { exists: false, manager: false, member: false };
+  return {
+    exists: true,
+    manager: p.managerId === userId || p.memberships.some((m) => m.role === "MANAGER"),
+    member: p.managerId === userId || p.memberships.length > 0,
+  };
 };
 const access = async (userId: string, role: Role, projectId: string) => {
   if (role === Role.ADMIN) return true;
-  const p = await prisma.project.findUnique({
-    where: { id: projectId },
-    select: {
-      managerId: true,
-      memberships: { where: { userId }, select: { id: true } },
-    },
-  });
-  return !!p && (p.managerId === userId || p.memberships.length > 0);
+  return (await projectRole(userId, projectId)).member;
 };
+const canManageProject = async (userId: string, role: Role, projectId: string) => {
+  if (role === Role.ADMIN) return true;
+  if (role !== Role.PROJECT_MANAGER && role !== Role.TEAM_MEMBER) return false;
+  return (await projectRole(userId, projectId)).manager;
+};
+const canReadTask = async (userId: string, role: Role, projectId: string, assigneeId: string | null) => {
+  if (!(await access(userId, role, projectId))) return false;
+  if (role === Role.TEAM_MEMBER) {
+    if ((await projectRole(userId, projectId)).manager) return true;
+    return assigneeId === userId;
+  }
+  return true;
+};
+const visibleTasksWhere = (userId: string, role: Role) =>
+  role === Role.TEAM_MEMBER
+    ? {
+        OR: [
+          { assigneeId: userId },
+          { project: { managerId: userId } },
+          { project: { memberships: { some: { userId, role: "MANAGER" as const } } } },
+        ],
+      }
+    : {};
 app.get("/api/health", (_q, res) => res.json({ ok: true }));
 app.post("/api/auth/login", async (req, res) => {
   const parsed = z
@@ -127,7 +149,7 @@ app.get("/api/projects", auth, async (req: AuthReq, res) => {
   const projects = await prisma.project.findMany({
     where,
     include: {
-      tasks: { where: req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}, include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } } } },
+      tasks: { where: visibleTasksWhere(req.user!.id, req.user!.role), include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } } } },
       manager: { select: { id: true, name: true } },
       memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } },
     },
@@ -167,9 +189,10 @@ app.get("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
   const projectId = String(req.params.id);
   if (!(await access(req.user!.id, req.user!.role, projectId)))
     return res.status(404).json({ error: "NOT_FOUND" });
+  const projectManager = await canManageProject(req.user!.id, req.user!.role, projectId);
   res.json(
     await prisma.task.findMany({
-      where: { projectId, ...(req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}) },
+      where: { projectId, ...(req.user!.role === Role.TEAM_MEMBER && !projectManager ? { assigneeId: req.user!.id } : {}) },
       include: {
         assignee: { select: { id: true, name: true } },
         comments: {
@@ -182,8 +205,11 @@ app.get("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
   );
 });
 app.post("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
-  if (!(await isManager(req.user!.id, req.user!.role, String(req.params.id))))
-    return res.status(403).json({ error: "FORBIDDEN" });
+  const projectId = String(req.params.id);
+  if (!(await canManageProject(req.user!.id, req.user!.role, projectId)))
+    return (await projectRole(req.user!.id, projectId)).exists
+      ? res.status(403).json({ error: "FORBIDDEN" })
+      : res.status(404).json({ error: "NOT_FOUND" });
   const b = z
     .object({
       title: z.string().min(1).max(200),
@@ -203,24 +229,27 @@ app.post("/api/projects/:id/tasks", auth, async (req: AuthReq, res) => {
       !(await access(
         b.data.assigneeId,
         Role.TEAM_MEMBER,
-        String(req.params.id),
+        projectId,
       ))
     )
       return res.status(400).json({ error: "ASSIGNEE_NOT_IN_PROJECT" });
   }
-  res
-    .status(201)
-    .json(
-      await prisma.task.create({
-        data: {
-          projectId: String(req.params.id),
-          title: b.data.title,
-          description: b.data.description || "",
-          assigneeId: b.data.assigneeId,
-        },
-        include: { assignee: { select: { id: true, name: true } } },
-      }),
-    );
+  const task = await prisma.$transaction(async (tx) => {
+    const created = await tx.task.create({
+      data: {
+        projectId,
+        title: b.data.title,
+        description: b.data.description || "",
+        assigneeId: b.data.assigneeId,
+      },
+      include: { assignee: { select: { id: true, name: true } } },
+    });
+    await tx.taskActivity.create({
+      data: { taskId: created.id, actorId: req.user!.id, eventType: "TASK_CREATED", details: { title: created.title } },
+    });
+    return created;
+  });
+  res.status(201).json(task);
 });
 app.get("/api/users", auth, async (req: AuthReq, res) => {
   if (req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "FORBIDDEN" });
@@ -252,11 +281,11 @@ app.patch("/api/users/:id/deactivate", auth, async (req: AuthReq, res) => {
 app.get("/api/projects/:id", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
   if (!(await access(req.user!.id, req.user!.role, id))) return res.status(404).json({ error: "NOT_FOUND" });
-  res.json(await prisma.project.findUnique({ where: { id }, include: { manager: { select: { id: true, name: true } }, memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } }, tasks: { where: req.user!.role === Role.TEAM_MEMBER ? { assigneeId: req.user!.id } : {}, include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } } } } } } }));
+  res.json(await prisma.project.findUnique({ where: { id }, include: { manager: { select: { id: true, name: true } }, memberships: { include: { user: { select: { id: true, name: true, email: true, role: true } } } }, tasks: { where: visibleTasksWhere(req.user!.id, req.user!.role), include: { assignee: { select: { id: true, name: true } }, comments: { include: { author: { select: { id: true, name: true } } } } } } } }));
 });
 app.patch("/api/projects/:id", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
-  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, id))) return (await projectRole(req.user!.id, id)).exists ? res.status(403).json({ error: "FORBIDDEN" }) : res.status(404).json({ error: "NOT_FOUND" });
   const b = z.object({ name: z.string().min(1).max(100).optional(), description: z.string().max(1000).optional(), managerId: z.string().optional() }).safeParse(req.body);
   if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
   if (b.data.managerId && req.user!.role !== Role.ADMIN) return res.status(403).json({ error: "ONLY_ADMIN_CAN_REASSIGN_MANAGER" });
@@ -266,7 +295,7 @@ app.patch("/api/projects/:id", auth, async (req: AuthReq, res) => {
 });
 app.patch("/api/projects/:id/archive", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
-  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, id))) return (await projectRole(req.user!.id, id)).exists ? res.status(403).json({ error: "FORBIDDEN" }) : res.status(404).json({ error: "NOT_FOUND" });
   const b = z.object({ archived: z.boolean() }).safeParse(req.body);
   if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
   const p = await prisma.project.update({ where: { id }, data: { archived: b.data.archived } }).catch(() => null);
@@ -285,7 +314,7 @@ app.get("/api/projects/:id/members", auth, async (req: AuthReq, res) => {
 });
 app.post("/api/projects/:id/members", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
-  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, id))) return (await projectRole(req.user!.id, id)).exists ? res.status(403).json({ error: "FORBIDDEN" }) : res.status(404).json({ error: "NOT_FOUND" });
   const b = z.object({ userId: z.string(), role: z.enum(["MANAGER", "MEMBER", "VIEWER"]) }).safeParse(req.body);
   if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
   const u = await prisma.user.findUnique({ where: { id: b.data.userId } });
@@ -295,7 +324,7 @@ app.post("/api/projects/:id/members", auth, async (req: AuthReq, res) => {
 });
 app.patch("/api/projects/:id/members/:userId", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
-  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, id))) return (await projectRole(req.user!.id, id)).exists ? res.status(403).json({ error: "FORBIDDEN" }) : res.status(404).json({ error: "NOT_FOUND" });
   const b = z.object({ role: z.enum(["MANAGER", "MEMBER", "VIEWER"]) }).safeParse(req.body);
   if (!b.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
   const member = await prisma.projectMember.update({ where: { projectId_userId: { projectId: id, userId: String(req.params.userId) } }, data: b.data }).catch(() => null);
@@ -304,26 +333,39 @@ app.patch("/api/projects/:id/members/:userId", auth, async (req: AuthReq, res) =
 app.delete("/api/tasks/:id", auth, async (req: AuthReq, res) => {
   const task = await prisma.task.findUnique({ where: { id: String(req.params.id) } });
   if (!task) return res.status(404).json({ error: "NOT_FOUND" });
-  if (!(await isManager(req.user!.id, req.user!.role, task.projectId))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, task.projectId))) return res.status(403).json({ error: "FORBIDDEN" });
   await prisma.task.delete({ where: { id: task.id } });
   res.status(204).end();
 });
+app.get("/api/tasks/:id/activity", auth, async (req: AuthReq, res) => {
+  const parsedId = z.string().cuid().safeParse(String(req.params.id));
+  if (!parsedId.success) return res.status(400).json({ error: "VALIDATION_ERROR" });
+  const task = await prisma.task.findUnique({ where: { id: parsedId.data } });
+  if (!task || !(await canReadTask(req.user!.id, req.user!.role, task.projectId, task.assigneeId)))
+    return res.status(404).json({ error: "NOT_FOUND" });
+  const activity = await prisma.taskActivity.findMany({
+    where: { taskId: task.id },
+    include: { actor: { select: { id: true, name: true } } },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  res.json(activity);
+});
 app.get("/api/tasks/:id/comments", auth, async (req: AuthReq, res) => {
   const task = await prisma.task.findUnique({ where: { id: String(req.params.id) } });
-  if (!task || !(await access(req.user!.id, req.user!.role, task.projectId))) return res.status(404).json({ error: "NOT_FOUND" });
+  if (!task || !(await canReadTask(req.user!.id, req.user!.role, task.projectId, task.assigneeId))) return res.status(404).json({ error: "NOT_FOUND" });
   res.json(await prisma.comment.findMany({ where: { taskId: task.id }, include: { author: { select: { id: true, name: true } } }, orderBy: { createdAt: "asc" } }));
 });
 app.delete("/api/comments/:id", auth, async (req: AuthReq, res) => {
   const comment = await prisma.comment.findUnique({ where: { id: String(req.params.id) }, include: { task: true } });
   if (!comment) return res.status(404).json({ error: "NOT_FOUND" });
-  const manager = await isManager(req.user!.id, req.user!.role, comment.task.projectId);
-  if (!manager && comment.authorId !== req.user!.id) return res.status(403).json({ error: "FORBIDDEN" });
+  const manager = await canManageProject(req.user!.id, req.user!.role, comment.task.projectId);
+  if (!manager && !(comment.authorId === req.user!.id && await canReadTask(req.user!.id, req.user!.role, comment.task.projectId, comment.task.assigneeId))) return res.status(403).json({ error: "FORBIDDEN" });
   await prisma.comment.delete({ where: { id: comment.id } });
   res.status(204).end();
 });
 app.delete("/api/projects/:id/members/:userId", auth, async (req: AuthReq, res) => {
   const id = String(req.params.id);
-  if (!(await isManager(req.user!.id, req.user!.role, id))) return res.status(403).json({ error: "FORBIDDEN" });
+  if (!(await canManageProject(req.user!.id, req.user!.role, id))) return (await projectRole(req.user!.id, id)).exists ? res.status(403).json({ error: "FORBIDDEN" }) : res.status(404).json({ error: "NOT_FOUND" });
   const result = await prisma.projectMember.deleteMany({ where: { projectId: id, userId: String(req.params.userId) } });
   return result.count ? res.status(204).end() : res.status(404).json({ error: "NOT_FOUND" });
 });
@@ -341,10 +383,11 @@ app.patch("/api/tasks/:id", auth, async (req: AuthReq, res) => {
   const t = await prisma.task.findUnique({
     where: { id: String(req.params.id) },
   });
-  if (!t || !(await access(req.user!.id, req.user!.role, t.projectId)))
+  if (!t || !(await canReadTask(req.user!.id, req.user!.role, t.projectId, t.assigneeId)))
     return res.status(404).json({ error: "NOT_FOUND" });
-  const manager = await isManager(req.user!.id, req.user!.role, t.projectId);
-  if (!manager && t.assigneeId !== req.user!.id)
+  const manager = await canManageProject(req.user!.id, req.user!.role, t.projectId);
+  const assignedMember = req.user!.role === Role.TEAM_MEMBER && t.assigneeId === req.user!.id;
+  if (req.user!.role === Role.VIEWER || (!manager && !assignedMember))
     return res.status(403).json({ error: "FORBIDDEN" });
   if (!manager && b.data.assigneeId !== undefined)
     return res.status(403).json({ error: "FORBIDDEN" });
@@ -361,11 +404,38 @@ app.patch("/api/tasks/:id", auth, async (req: AuthReq, res) => {
       return res.status(400).json({ error: "ASSIGNEE_NOT_IN_PROJECT" });
   }
   const { version, ...data } = b.data;
-  const update = await prisma.task.updateMany({
-    where: { id: t.id, version },
-    data: { ...data, version: { increment: 1 } },
-  });
-  if (!update.count) {
+  const changes: Record<string, { from: string; to: string }> = {};
+  if (data.title !== undefined && data.title !== t.title) changes.title = { from: t.title, to: data.title };
+  if (data.description !== undefined && data.description !== t.description) changes.description = { from: t.description, to: data.description };
+  if (data.status !== undefined && data.status !== t.status) changes.status = { from: t.status, to: data.status };
+  if (data.assigneeId !== undefined && data.assigneeId !== t.assigneeId) {
+    const ids = [t.assigneeId, data.assigneeId].filter((id): id is string => !!id);
+    const people = ids.length ? await prisma.user.findMany({ where: { id: { in: ids } }, select: { id: true, name: true } }) : [];
+    const names = new Map(people.map((person) => [person.id, person.name]));
+    changes.assignee = { from: t.assigneeId ? names.get(t.assigneeId) || "Assignee" : "Unassigned", to: data.assigneeId ? names.get(data.assigneeId) || "Assignee" : "Unassigned" };
+  }
+  const changedFields = Object.keys(changes);
+  const eventType = changedFields.length === 1 && changes.status ? "TASK_STATUS_CHANGED"
+    : changedFields.length === 1 && changes.assignee ? "TASK_ASSIGNEE_CHANGED"
+    : changedFields.length > 0 && changedFields.every((field) => field === "title" || field === "description") ? "TASK_DETAILS_CHANGED"
+    : "TASK_UPDATED";
+  let updated;
+  try {
+    updated = await prisma.$transaction(async (tx) => {
+      const result = await tx.task.updateMany({
+        where: { id: t.id, version },
+        data: { ...data, version: { increment: 1 } },
+      });
+      if (!result.count) throw new Error("TASK_VERSION_CONFLICT");
+      if (changedFields.length) {
+        await tx.taskActivity.create({
+          data: { taskId: t.id, actorId: req.user!.id, eventType, details: { changes } },
+        });
+      }
+      return tx.task.findUnique({ where: { id: t.id }, include: { assignee: { select: { id: true, name: true } } } });
+    });
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "TASK_VERSION_CONFLICT") throw error;
     const current = await prisma.task.findUnique({
       where: { id: t.id },
       select: {
@@ -378,12 +448,7 @@ app.patch("/api/tasks/:id", auth, async (req: AuthReq, res) => {
     });
     return res.status(409).json({ error: "TASK_VERSION_CONFLICT", current });
   }
-  res.json(
-    await prisma.task.findUnique({
-      where: { id: t.id },
-      include: { assignee: { select: { id: true, name: true } } },
-    }),
-  );
+  res.json(updated);
 });
 app.post("/api/tasks/:id/comments", auth, async (req: AuthReq, res) => {
   const b = z.object({ body: z.string().min(1).max(2000) }).safeParse(req.body);
@@ -391,18 +456,23 @@ app.post("/api/tasks/:id/comments", auth, async (req: AuthReq, res) => {
   const t = await prisma.task.findUnique({
     where: { id: String(req.params.id) },
   });
-  if (!t || !(await access(req.user!.id, req.user!.role, t.projectId)))
+  if (!t || !(await canReadTask(req.user!.id, req.user!.role, t.projectId, t.assigneeId)))
     return res.status(404).json({ error: "NOT_FOUND" });
-  if (req.user!.role === Role.VIEWER)
+  const manager = await canManageProject(req.user!.id, req.user!.role, t.projectId);
+  const assignedMember = req.user!.role === Role.TEAM_MEMBER && t.assigneeId === req.user!.id;
+  if (req.user!.role === Role.VIEWER || (!manager && !assignedMember))
     return res.status(403).json({ error: "FORBIDDEN" });
-  res
-    .status(201)
-    .json(
-      await prisma.comment.create({
-        data: { taskId: t.id, authorId: req.user!.id, body: b.data.body },
-        include: { author: { select: { id: true, name: true } } },
-      }),
-    );
+  const comment = await prisma.$transaction(async (tx) => {
+    const created = await tx.comment.create({
+      data: { taskId: t.id, authorId: req.user!.id, body: b.data.body },
+      include: { author: { select: { id: true, name: true } } },
+    });
+    await tx.taskActivity.create({
+      data: { taskId: t.id, actorId: req.user!.id, eventType: "COMMENT_ADDED", details: { commentId: created.id } },
+    });
+    return created;
+  });
+  res.status(201).json(comment);
 });
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err instanceof Error ? err.message : "Unexpected error");
